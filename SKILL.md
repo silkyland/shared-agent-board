@@ -10,7 +10,7 @@ description: >-
   room.
 license: MIT
 metadata:
-  version: "2"
+  version: "3"
 ---
 
 # Shared Agent Board
@@ -63,7 +63,10 @@ second deliberately).
 
 ## Worker loop
 
+Read the goal first, then pull work:
+
 ```bash
+python3 scripts/board.py goal                           # the room's objective
 python3 scripts/board.py join --as "$ME"
 python3 scripts/board.py task next --as "$ME"          # claim the next assigned task
 python3 scripts/board.py claim --as "$ME" --kind port --hint gdb --ttl 3600
@@ -87,7 +90,21 @@ returns it; two sessions cannot receive the same value.
    python3 scripts/board.py init --as "$ME" --title "..." --goal @goal.md
    ```
 
-2. Write the plan before anyone starts:
+2. State the goal as a living sentence — what is true now, and what "done"
+   looks like. Every joiner sees it, and every digest repeats it:
+
+   ```bash
+   python3 scripts/board.py goal "detect usb outdated & unsupported driver
+   but we need to create ourselves, make it fully support"
+   python3 scripts/board.py goal            # read the current goal
+   python3 scripts/board.py goal --history  # who changed it, and when
+   ```
+
+   When you are the room's orchestrator, `--as` is optional here: the command
+   attributes the goal to the orchestrator. Goal revisions are append-only, so
+   a drifting objective is visible instead of silent.
+
+3. Write the plan before anyone starts:
 
    ```bash
    python3 scripts/board.py plan --as "$ME" --set @plan.md
@@ -102,7 +119,9 @@ returns it; two sessions cannot receive the same value.
    ```
 
 4. Re-plan when evidence changes the picture. A stale plan is worse than none.
-5. Arbitrate: release expired or abandoned claims, reassign tasks, retire
+5. Revise the goal only when the objective itself changed — not when a plan
+   step changed. That distinction is what keeps old evidence interpretable.
+6. Arbitrate: release expired or abandoned claims, reassign tasks, retire
    sessions that left (`retire --agent NAME` frees claims and reopens tasks).
 
 Task states are `open → claimed → done`; `task next` refuses blocked tasks and
@@ -134,7 +153,8 @@ python3 scripts/board.py digest
 python3 scripts/board.py export --out ./board-view
 ```
 
-`digest` prints the plan, a per-agent table, open questions and tasks.
+`digest` prints the goal, the plan, a per-agent table, open questions and
+tasks.
 `export` materializes README, per-agent status, and numbered posts as markdown
 for humans, git, or a repo. Observers may predict; they must label predictions
 and must not run the experiments or edit claims.

@@ -80,6 +80,23 @@ class BoardTest(unittest.TestCase):
         self.assertIn("worker-1", digest)
         self.assertIn("probe ok", digest)
 
+    def test_goal_is_visible_and_revisable(self):
+        self.init_room()
+        self.assertEqual(self.run_json("goal")["goal"], "goal")
+
+        # the orchestrator can set it without repeating --as
+        self.run_board("goal", "new objective")
+        self.assertEqual(self.run_json("goal")["goal"], "new objective")
+        history = self.run_json("goal", "--history")
+        self.assertEqual(len(history["history"]), 2)
+
+        joined = self.run_json("join", "--as", "worker-1")
+        self.assertEqual(joined["goal"], "new objective")
+        self.assertIn("new objective", self.run_board("digest").stdout)
+
+        denied = self.run_board("goal", "--as", "worker-1", "nope", ok=False)
+        self.assertNotEqual(denied.returncode, 0)
+
     def test_discovery_walks_up(self):
         room = self.init_room()
         nested = self.dir / "a" / "b"

@@ -53,6 +53,7 @@ in paths and exports.
 | `room` | id, code, title, goal, workspace, port range |
 | `agents` | name (PK), role, joined_at, last_seen, retired_at |
 | `plan` | append-only plan versions; latest wins |
+| `goals` | append-only goal revisions; latest wins |
 | `tasks` | title, detail, owner, state, blocked_by, note |
 | `claims` | kind, value, agent, hint, created_at, expires_at, released_at |
 | `status` | one current-truth snapshot per agent |
@@ -60,6 +61,21 @@ in paths and exports.
 
 A unique partial index on `(kind, value) WHERE released_at IS NULL` is the
 lock: two live claims cannot share a value, released ones do not block reuse.
+
+### Goal, plan, task
+
+These are three different altitudes and should not be collapsed:
+
+| Level | Question | Changes when |
+|---|---|---|
+| goal | what outcome are we buying, and why? | the objective itself changes |
+| plan | how are we getting there, in what order? | evidence changes the route |
+| task | what is one unit of work, and who owns it? | work is started, blocked, done |
+
+The goal is shown by `goal`, `room`, `join`, `digest`, and `export`. Revisions
+are append-only (`goal --history`), so a drifting objective is visible instead
+of being silently overwritten. Only an orchestrator may set it; when the caller
+omits `--as`, the command attributes the change to the room's orchestrator.
 
 ## 4. Resource allocation
 

@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 POINTER = ".agentboard"
-SCHEMA = 2
+SCHEMA = 3
 ROLES = ("orchestrator", "worker", "observer")
 KINDS = ("port", "socket", "path", "worktree", "lock", "custom")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -153,6 +153,7 @@ def connect(db: Path) -> sqlite3.Connection:
     con.execute("PRAGMA busy_timeout=15000")
     if con.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='room'").fetchone()[0] == 0:
         die(f"not a board room: {db}")
+    schema(con)
     return con
 
 
@@ -190,6 +191,12 @@ def schema(con: sqlite3.Connection, overwrite: bool = False) -> None:
             retired_at TEXT
         );
         CREATE TABLE IF NOT EXISTS plan(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS goals(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             agent TEXT NOT NULL,
             body TEXT NOT NULL,
@@ -248,6 +255,16 @@ def room_row(con: sqlite3.Connection) -> sqlite3.Row:
     if row is None:
         die("room is empty")
     return row
+
+
+def current_goal(con: sqlite3.Connection) -> sqlite3.Row | None:
+    row = con.execute("SELECT * FROM goals ORDER BY id DESC LIMIT 1").fetchone()
+    if row is not None:
+        return row
+    room = room_row(con)
+    if room["goal"]:
+        return {"agent": None, "body": room["goal"], "created_at": room["created_at"]}
+    return None
 
 
 def agent_row(con: sqlite3.Connection, name: str | None) -> sqlite3.Row:
@@ -408,11 +425,17 @@ def cmd_init(args) -> None:
     room_id = secrets.token_hex(8)
     code = secrets.token_hex(3)
     stamp = now()
+    goal = read_arg(args.goal)
     con.execute(
         "INSERT INTO room(id, code, title, goal, workspace, port_start, port_end, created_at) "
         "VALUES(?,?,?,?,?,?,?,?)",
-        (room_id, code, args.title, read_arg(args.goal), str(workspace), lo, hi, stamp),
+        (room_id, code, args.title, goal, str(workspace), lo, hi, stamp),
     )
+    if goal:
+        con.execute(
+            "INSERT INTO goals(agent, body, created_at) VALUES(?,?,?)",
+            (name, goal, stamp),
+        )
     con.execute(
         "INSERT INTO agents(name, role, joined_at, last_seen) VALUES(?,?,?,?)",
         (name, "orchestrator", stamp, stamp),
@@ -437,6 +460,7 @@ def cmd_init(args) -> None:
             "pointer": pointer,
             "lines": [
                 f"room     {room_id}",
+                f"goal     {goal or '(unset — set it with: board.py goal \"...\")'}",
                 f"database {db}",
                 f"code     {code}   (share only with invited agents)",
                 f"workspace {workspace}",
@@ -478,6 +502,7 @@ def cmd_join(args) -> None:
             (name, role, stamp, stamp),
         )
     con.execute("UPDATE agents SET last_seen = ? WHERE name = ?", (now(), name))
+    goal = current_goal(con)
     claims = [
         {"id": r["id"], "kind": r["kind"], "value": r["value"]}
         for r in con.execute(
@@ -492,9 +517,11 @@ def cmd_join(args) -> None:
             "as": name,
             "role": role,
             "via": source,
+            "goal": goal["body"] if goal else None,
             "claims": claims,
             "lines": [
                 f"joined room {room['id']} as {name} ({role}) via {source}",
+                f"goal     {goal['body'] if goal else '(unset)'}",
                 f"database {db}",
                 f"claims   {len(claims)} active",
             ],
@@ -514,16 +541,19 @@ def cmd_room(args) -> None:
     claims = con.execute(
         "SELECT kind, value, agent FROM claims WHERE released_at IS NULL ORDER BY kind, value"
     ).fetchall()
+    goal = current_goal(con)
     payload = {
         "ok": True,
         "room": room["id"],
         "db": str(db),
         "via": source,
         "title": room["title"],
+        "goal": goal["body"] if goal else None,
         "agents": [dict(a) for a in agents],
         "claims": [dict(c) for c in claims],
         "lines": [
             f"room     {room['id']} — {room['title']}",
+            f"goal     {goal['body'] if goal else '(unset)'}",
             f"database {db} (found via {source})",
             f"agents   {', '.join(a['name'] + ':' + a['role'] for a in agents)}",
             f"claims   {len(claims)} active",
@@ -533,6 +563,64 @@ def cmd_room(args) -> None:
         payload["code"] = room["code"]
         payload["lines"].append(f"code     {room['code']}")
     emit(payload, args.json)
+    con.close()
+
+
+def cmd_goal(args) -> None:
+    db, _ = resolve_db(args.db)
+    con = connect(db)
+    if args.history:
+        rows = con.execute("SELECT * FROM goals ORDER BY id").fetchall()
+        lines = []
+        for r in rows:
+            lines.append(f"# {r['id']}  {r['created_at']}  {r['agent']}")
+            lines.extend("    " + x for x in str(r["body"]).splitlines())
+            lines.append("")
+        emit({"ok": True, "history": [dict(r) for r in rows],
+              "lines": lines or ["(no goal history)"]}, args.json)
+        con.close()
+        return
+
+    text = args.set_text if args.set_text is not None else args.text
+    if text is None:
+        goal = current_goal(con)
+        if goal is None:
+            die("no goal set. The orchestrator sets one: board.py goal \"...\"")
+        emit(
+            {"ok": True, "goal": goal["body"], "by": goal["agent"],
+             "at": goal["created_at"], "lines": [goal["body"]]},
+            args.json,
+        )
+        con.close()
+        return
+
+    row = None
+    explicit = args.name or os.environ.get("AGENT_BOARD_NAME")
+    if explicit:
+        row = agent_row(con, explicit)
+    else:
+        row = con.execute(
+            "SELECT * FROM agents WHERE role='orchestrator' AND retired_at IS NULL "
+            "ORDER BY joined_at LIMIT 1"
+        ).fetchone()
+        if row is None:
+            die("no orchestrator in this room; pass --as NAME")
+    require_role(row, ("orchestrator",))
+    body = read_arg(text) or ""
+    if not body.strip():
+        die("empty goal")
+    stamp = now()
+    with tx(con):
+        con.execute(
+            "INSERT INTO goals(agent, body, created_at) VALUES(?,?,?)",
+            (row["name"], body, stamp),
+        )
+        con.execute("UPDATE room SET goal = ?", (body,))
+    emit(
+        {"ok": True, "goal": body, "by": row["name"], "at": stamp,
+         "lines": [f"goal set by {row['name']}", body]},
+        args.json,
+    )
     con.close()
 
 
@@ -861,6 +949,9 @@ def cmd_digest(args) -> None:
         "SELECT * FROM agents WHERE retired_at IS NULL ORDER BY role, name"
     ).fetchall()
     lines = [f"# digest — {room['title']}", f"room {room['id']}", ""]
+    goal = current_goal(con)
+    if goal:
+        lines += ["## goal", "", goal["body"], ""]
     plan = con.execute("SELECT * FROM plan ORDER BY id DESC LIMIT 1").fetchone()
     if plan:
         lines += [f"## plan (by {plan['agent']})", plan["body"], ""]
@@ -921,8 +1012,9 @@ def cmd_export(args) -> None:
     posts = con.execute("SELECT * FROM posts ORDER BY id").fetchall()
 
     readme = [f"# {room['title']}", "", f"Room `{room['id']}`", ""]
-    if room["goal"]:
-        readme += ["## Goal", "", room["goal"], ""]
+    goal = current_goal(con)
+    if goal:
+        readme += ["## Goal", "", goal["body"], ""]
     if plan:
         readme += [f"## Plan (by {plan['agent']})", "", plan["body"], ""]
     readme += ["## Agents", "", "| agent | role | last seen |", "|---|---|---|"]
@@ -1027,6 +1119,10 @@ def cmd_seed(args) -> None:
         "INSERT INTO agents(name, role, joined_at, last_seen) VALUES(?,?,?,?)",
         (names[0], "orchestrator", stamp, stamp),
     )
+    con.execute(
+        "INSERT INTO goals(agent, body, created_at) VALUES(?,?,?)",
+        (names[0], args.goal, stamp),
+    )
     for name in names[1:]:
         con.execute(
             "INSERT INTO agents(name, role, joined_at, last_seen) VALUES(?,?,?,?)",
@@ -1093,6 +1189,12 @@ def build_parser() -> argparse.ArgumentParser:
     q = sub.add_parser("plan", parents=[common], help="write or show the plan")
     q.add_argument("--set", dest="set_text", help="plan text, @file or '-'")
     q.set_defaults(func=cmd_plan)
+
+    q = sub.add_parser("goal", parents=[common], help="show, set or review the room goal")
+    q.add_argument("text", nargs="?", help="goal text (or use --set for @file / '-')")
+    q.add_argument("--set", dest="set_text", help="goal text, @file or '-'")
+    q.add_argument("--history", action="store_true", help="list every goal revision")
+    q.set_defaults(func=cmd_goal)
 
     q = sub.add_parser("task", parents=[common], help="plan tasks")
     q.add_argument("action", choices=("add", "list", "show", "assign", "next", "claim", "done"))

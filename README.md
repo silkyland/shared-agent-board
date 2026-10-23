@@ -38,6 +38,12 @@ orchestrator ──init──▶ room.db ──join──▶ workers
 # the orchestrator creates the room (writes a .agentboard pointer in cwd)
 python3 scripts/board.py init --as "$ME" --title "Incident room" --goal @goal.md
 
+# state the objective as a living sentence; everyone who joins sees it
+python3 scripts/board.py goal "detect usb outdated & unsupported driver
+but we need to create ourselves, make it fully support"
+python3 scripts/board.py goal            # read it
+python3 scripts/board.py goal --history  # append-only revisions
+
 # peers join from the same tree, or with --code when pointing at a path
 python3 scripts/board.py join --as "$PEER"
 
@@ -62,7 +68,8 @@ python3 scripts/board.py task done --as "$PEER" --id 1
 |---|---|
 | `init` | create the room (orchestrator), print code + database path |
 | `join` | join by discovered room, or by `--db` + `--code` |
-| `room` | show the discovered room, agents and active claims |
+| `room` | show the discovered room, goal, agents and active claims |
+| `goal ["text"]`, `--history` | read, set or review the room objective |
 | `plan --set/--show` | write or read the orchestrator's plan |
 | `task add/list/show/assign/next/claim/done` | plan, assign, pull and close work |
 | `claim --kind port\|socket\|path\|worktree\|lock\|custom` | allocate a resource |
@@ -84,8 +91,8 @@ Every command accepts `--json`; identity comes from `--as` or
   availability, sockets get a private runtime directory, paths get a room
   workspace.
 - Claims can expire (`--ttl`), so a crashed session does not block the room.
-- Only an orchestrator can `init`, write the plan, assign tasks, or retire an
-  agent.
+- Only an orchestrator can `init`, set the goal, write the plan, assign tasks,
+  or retire an agent.
 - Posts are immutable and always carry one next question (override with
   `--no-question`, deliberately).
 - Joining by explicit path requires the room code, so pointing at the wrong
