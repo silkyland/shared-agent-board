@@ -1,5 +1,7 @@
 # shared-agent-board
 
+[![skills.sh](https://skills.sh/b/silkyland/shared-agent-board)](https://skills.sh/silkyland/shared-agent-board)
+
 A skill for running **several autonomous agent sessions against one hard
 problem** on one machine, without a chat channel.
 
