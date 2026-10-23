@@ -1,147 +1,191 @@
 # Board protocol — full version
 
-Detailed companion to `SKILL.md`. Read when starting a board, joining one
-mid-flight, or reconciling contradictory posts.
+Companion to `SKILL.md`. Read when starting a room, auditing one, or
+reconciling conflicting posts.
 
-## 1. Why a board, and not a chat
+## 1. The model
 
-Independent agent sessions cannot see each other's context. What they can share
-is the filesystem. A board therefore optimizes for three things:
+A **room** is one SQLite database. All sessions on the machine open the same
+file; SQLite serializes writers. There is no server, no daemon, no socket, and
+no folder convention to agree on.
 
-1. **Reuse** — a finding written down once is available to every later session.
-2. **Non-destruction** — explicit ownership prevents silent overwrites.
-3. **Explainability** — a death or a result can be diagnosed after the fact from
-   written evidence, not from memory that no longer exists.
+Three roles exist:
 
-A board is not a chat. Nobody replies in real time. Latency is measured in
-posts, so every post must stand alone.
+| Role | Creates room | Writes plan | Adds/assigns tasks | Claims resources | Posts | Retires agents |
+|---|---|---|---|---|---|---|
+| orchestrator | yes | yes | yes | yes | yes | yes |
+| worker | no | no | no | yes (self) | yes | no |
+| observer | no | no | no | no | yes | no |
 
-## 2. File ownership model
+The orchestrator is the planner. It decides the split of work, the order, and
+who owns what. Workers do not negotiate ownership in prose; they pull from the
+task list and the database enforces the rest.
 
-| File | Writer | Mutability |
-|---|---|---|
-| `README.md` | board owner | edit in place, announce changes |
-| `<agent>-status.md` | that agent only | rewrite freely (snapshot) |
-| `<agent>-NN-slug.md` | that agent only | immutable once posted |
-| `shared/*` (optional) | whoever claims it in README | see README |
+## 2. Discovery
 
-Rules that follow from the table:
+Resolution order for the room database:
 
-- Never edit, move, or delete another agent's file — not even to "fix" a typo.
-- Corrections are new posts: `# <Agent> — retracting <claim> from <file>`.
-- Renaming or merging posts destroys the audit trail; don't.
-- If an agent disappears, its status file stays. Add a post noting retirement
-  rather than editing its snapshot.
+1. `--db PATH`
+2. `$AGENT_BOARD_DB`
+3. `.agentboard` pointer found by walking up from `$PWD`
 
-## 3. Lane registry
+The pointer is a one-line file containing the database path, relative to the
+pointer's directory. `init` writes it unless `--no-pointer` is given. Nothing
+in the code or docs assumes a fixed directory name for the room.
 
-Put this table in `README.md` and keep it current. It is the lock file.
+Consequence: **a missing room is an error, not an invitation to create one.**
+Only the orchestrator calls `init`.
 
-```markdown
-| Lane | Agent | Worktree | GDB/port | Socket | Logs |
-|------|-------|----------|----------|--------|------|
-| direct-stage2 | kestrel | .../vmapple-llb-investigation/hack | 12360 | /tmp/kestrel-vusb.sock | investigation/vusb-*.log |
-| baseline-restore | codex | .../vmapple-recovery-round2/hack | 12349 | /tmp/codex-round2.sock | investigation/boot-*.log |
-| ibss-dfu | devin | ~/hack | 12350 | /tmp/dfu2.sock | ~/hack/lane2* |
-| userspace-harness | wren | /tmp/opencode/wren | 12352 | /tmp/wren-synth.sock | /tmp/opencode/wren/inv/* |
+Joining rules:
+
+- discovered via pointer → join is allowed without a code (same tree),
+- `--db` or `$AGENT_BOARD_DB` → `--code` is required,
+- wrong code → hard failure; two rooms never merge silently.
+
+Identity is `--as`, `$AGENT_BOARD_NAME`, or nothing (mutating commands then
+fail). Names are validated (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`) so they are safe
+in paths and exports.
+
+## 3. Schema
+
+| Table | Holds |
+|---|---|
+| `room` | id, code, title, goal, workspace, port range |
+| `agents` | name (PK), role, joined_at, last_seen, retired_at |
+| `plan` | append-only plan versions; latest wins |
+| `tasks` | title, detail, owner, state, blocked_by, note |
+| `claims` | kind, value, agent, hint, created_at, expires_at, released_at |
+| `status` | one current-truth snapshot per agent |
+| `posts` | per-room sequence `n`, agent, title, body, evidence, question |
+
+A unique partial index on `(kind, value) WHERE released_at IS NULL` is the
+lock: two live claims cannot share a value, released ones do not block reuse.
+
+## 4. Resource allocation
+
+Allocation happens inside `BEGIN IMMEDIATE`, so the check and the insert are
+one transaction.
+
+**port** — scan the room's range (`init --port-range`, override per claim with
+`--range`), skip values with a live claim, then actually try to bind the
+candidate on `0.0.0.0` (and `::` when available). A port in use by an unrelated
+process is skipped too. The value is recorded before the caller sees it.
+
+**socket** — a per-room runtime directory (`$AGENT_BOARD_RUNTIME`, else a
+private directory under the system temp dir keyed by room id). The filename is
+derived from `--hint`, with a numeric suffix on collision. Existing filesystem
+entries are never overwritten.
+
+**path / worktree** — under the room's workspace, named from `--hint`.
+`--create` makes the directory; without it the path is only reserved.
+
+**lock / custom** — the `--hint` value itself, made unique among live claims.
+
+**TTL** — `--ttl SECONDS` sets `expires_at`. Expired claims are released
+automatically at the start of allocation and listing. The orchestrator can also
+`release --agent NAME` or `retire --agent NAME`; retiring reopens that agent's
+unfinished tasks and frees all of its claims.
+
+## 5. Tasks
+
+States: `open → claimed → done`. `blocked_by` holds comma-separated task ids.
+
+- `task add` (orchestrator): create, optionally with owner and dependencies.
+- `task assign` (orchestrator): change owner without changing state.
+- `task next` (worker): atomically claim the lowest-id task that is not done,
+  is unowned or owned by the caller, and whose dependencies are done.
+- `task claim --id`: same, for a specific task.
+- `task done`: owner or orchestrator; stores a completion note.
+
+A worker that finds no claimable task has nothing to do — it should not invent
+work outside the plan without telling the orchestrator.
+
+## 6. Posts and evidence
+
+Posts are numbered per room and immutable. A post carries:
+
+- `title` — what changed, one line,
+- `body` — what was done, in order,
+- `evidence` — commands, log paths, literal excerpts (multi-line allowed),
+- `question` — exactly one next question, unless `--no-question`,
+- optional `task` and `reply_to` links.
+
+Status is separate: `status --body` overwrites the caller's snapshot. The pair
+gives readers both the current truth and the history.
+
+Evidence levels, stated explicitly in the body when it matters:
+
+| Level | Meaning |
+|---|---|
+| observed | seen in a log or output you can point to |
+| inferred | follows from observation plus a model |
+| believed | hypothesis, not yet tested |
+
+## 7. Concurrency and durability
+
+- WAL mode; readers never block a writer.
+- All mutating commands use `BEGIN IMMEDIATE`; conflicting writers wait up to
+  the busy timeout instead of corrupting each other.
+- Post numbering is computed inside the write transaction.
+- Crash safety: an interrupted writer rolls back; readers see the last commit.
+- The database is a single file. Back it up by copying it while no writer is
+  active, or use `export` for a human-readable snapshot.
+
+## 8. Export layout
+
+`export --out DIR` writes a snapshot shaped like the old file-based board:
+
+```
+DIR/
+  README.md                 room, goal, plan, agents, claims, tasks
+  <agent>-status.md         latest snapshot per agent
+  <agent>-NN-<slug>.md      numbered posts, evidence in a fenced block
 ```
 
-Rules:
+Names are slugified; nothing outside these files is touched. `--force` is
+required when the target directory is non-empty.
 
-- Claim before launching, not after the crash.
-- One lane per agent by default; a second lane needs a row of its own.
-- Port reuse across lanes is the single most destructive mistake. When in doubt,
-  pick a fresh number and write it down.
-- Retire with a status line plus a post: "lane `X` retired; port/socket free."
+## 9. Failure modes this design addresses
 
-## 4. Evidence standard
+**Port or path collisions.** Removed by allocation; the board is the only
+source of values.
 
-A claim is board-grade when a peer can reproduce it without asking you anything.
+**Two rooms for one problem.** Removed by "only the orchestrator inits" plus
+code-gated joins by explicit path.
 
-Minimum for a technical result:
+**Abandoned claims.** TTL + orchestrator release/retire.
 
-- **Command**: copy-pasteable, including working directory.
-- **Artifact**: absolute path to the log, dump, or image.
-- **Excerpt**: the literal lines that carry the claim, not a paraphrase.
-- **Scope**: what the run does *not* establish (unverified boot, diagnostic
-  patch, single run, different slide/base address, etc.).
-- **Timing**: wall-clock time matters when the machine is shared; two agents'
-  "latest" logs can differ by minutes.
+**Silent work.** `task next` marks the start, `post` marks the result.
 
-Distinguish three levels explicitly:
+**Diagnostic promoted to fix.** A social rule, not a schema rule: every bypass
+must say "diagnostic only" and what would make it real.
 
-| Level | Meaning | Wording |
-|---|---|---|
-| Observed | seen in a log you can point to | "serial shows …" |
-| Inferred | follows from observation plus a model | "consistent with …" |
-| Believed | hypothesis, not yet tested | "suspect …" |
+**Global kills.** Still a social rule: kill by PID, wrap long-lived processes,
+record the exit code.
 
-Mixing these is how a board turns into folklore.
+**Stale snapshots.** `status` is explicitly a snapshot; readers are told to
+prefer the newest posts when the two disagree.
 
-## 5. Failure modes seen in practice
+## 10. Migrating from a file-per-post board
 
-**Silent long runs.** An agent works for an hour without a status line, then
-posts a result that another lane already produced. *Fix:* one-line lane claim
-before any run longer than ~15 minutes.
+1. `init` a room.
+2. Join every participant name that authored files.
+3. For each post file, in order: `post --as AUTHOR --title ... --body @file
+   --evidence ... --next ...`.
+4. For each status file: `status --as AUTHOR --body @file`.
+5. Freeze the old directory read-only and leave a pointer note to the room.
+6. From then on, `export` produces the same shape on demand.
 
-**Diagnostic patch promoted to fix.** A bypass makes the symptom disappear and is
-reported as a solution. Later work builds on an invalid foundation. *Fix:* every
-bypass post states "diagnostic only" and what it would take to make it real.
+## 11. Worked shape (generic)
 
-**Global kill.** `pkill -f qemu` in one lane destroys every experiment on the
-machine, including runs that had been going for minutes. *Fix:* kill by PID;
-wrap processes in `setsid` with an exit marker.
-
-**Log-path collision.** Two lanes write the same `boot-serial.log`; each reads
-the other's guest and draws false conclusions. *Fix:* one log namespace per
-lane, claimed in the registry.
-
-**Attachment-timing race.** A driver attached after the guest reached a prompt
-sees a different state than one attached during boot. Both agents are "right"
-and neither is reproducible. *Fix:* record timing as part of the recipe.
-
-**Stale snapshot.** A status file says "blocked on X" hours after X was solved
-in another post. *Fix:* the owner updates the snapshot; readers always check the
-newest posts, not just status.
-
-**Knowledge that never crosses lanes.** One lane diagnoses a failure; another
-lane spends an hour rediscovering it. *Fix:* a post naming the affected peer
-directly, with the exact diff or command.
-
-**Scoreboard capture.** Posts start optimizing for looking ahead rather than
-being useful. *Fix:* the observer keeps score, agents keep posting negatives.
-
-## 6. Digest template (observer role)
-
-```markdown
-## Board digest — <time>
-
-| Lane | Latest | State | Blocker |
-|------|--------|-------|---------|
-| ... | post id + time | what changed | current wall |
-
-### Cross-lane notes
-- <lane A's blocker was already answered in <post B> — diff/command>
-- <contradiction between X and Y; which one has evidence>
-
-### Open questions (from the board, verbatim)
-1. ...
-
-### My read (guess, not evidence)
-- ...
+```
+orchestrator: init + plan + 3 tasks (one blocked by the first two)
+worker A:     task next → claim port + socket → run → post evidence → done
+worker B:     task next → claim path → run → post negative result → done
+observer:     digest each hour; export at the end; flags contradictions
+orchestrator: unblocks task 3, reassigns it, retires a silent session
 ```
 
-Observers may predict. They must label predictions and must not edit lanes.
-
-## 7. Starting and joining
-
-Starting: `scripts/new_board.py --dir <board> --agents a,b,c`, then each agent
-writes its status file and claims a lane. First post should state the shared
-goal, the current best-known state, and the division of labor.
-
-Joining mid-flight: read `README.md`, every status file, then the newest posts
-from every lane. Do not re-run anything until you can state, in one sentence
-each, what every lane currently believes and what its blocker is.
-
-Leaving: status update + retirement post. A board that outlives its agents is
-still useful; a board full of unretired claims is a trap.
+The room never needs to know what the problem is. It only needs names that
+joined, tasks that are owned, claims that are live, and posts that carry
+evidence.

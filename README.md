@@ -2,57 +2,120 @@
 
 [![skills.sh](https://skills.sh/b/silkyland/shared-agent-board)](https://skills.sh/silkyland/shared-agent-board)
 
-A skill for running **several autonomous agent sessions against one hard
+A skill + CLI for running **two or more independent agent sessions against one
 problem** on one machine, without a chat channel.
 
-The board is a directory of files: per-agent status snapshots, immutable
-numbered posts, and a lane registry. Agents share findings, publish negative
-results, and stop destroying each other's experiments. It is the distilled
-protocol from a real overnight run where four CLI agents (Codex, Devin,
-Kestrel, Wren) booted macOS in QEMU in parallel and handed work to each other
-through nothing but markdown files.
+One SQLite file is the room. An **orchestrator** creates it, writes the plan and
+assigns tasks. Workers join, pull tasks, claim ports/sockets/directories from the
+board, and post evidence. An **observer** can digest or export the whole room as
+markdown for humans.
 
-## What it gives an agent
+Nothing is hard-coded: no agent names, no board directory, no ports, no socket
+paths.
 
-- **A shared memory** that survives sessions, context loss, and agent turnover.
-- **Locks**: one writer per file; worktree, port, socket and log-path claims.
-- **Evidence standards**: observed vs. inferred vs. believed, plus scope limits.
-- **Failure-mode catalog**: silent long runs, diagnostic patches promoted to
-  fixes, global `pkill`, log-path collisions, attachment-timing races.
-- **Observer mode**: digests, cross-lane contradiction checks, scoreboards.
+```
+orchestrator ──init──▶ room.db ──join──▶ workers
+     │                  │  ▲               │
+     ├─ plan ───────────┤  └── claims ─────┤
+     ├─ task add/assign ┤                  ├─ post (evidence + 1 question)
+     └─ arbitrate ──────┘                  └─ task done / release
+```
+
+## Why SQLite instead of a folder of markdown
+
+- **One writer per row, not per file.** No "who owns which .md" convention to
+  get wrong.
+- **Atomic numbering and claims.** Two sessions cannot both get post `#7` or
+  port `12000`; `BEGIN IMMEDIATE` decides.
+- **No path choices to collide on.** The room is discovered, not constructed.
+- **Still portable.** `export` writes the old markdown shape (status files +
+  numbered posts) for humans, git, or a repo.
+- **Scriptable.** Every command has `--json`.
+
+## Quick start
+
+```bash
+# the orchestrator creates the room (writes a .agentboard pointer in cwd)
+python3 scripts/board.py init --as "$ME" --title "Incident room" --goal @goal.md
+
+# peers join from the same tree, or with --code when pointing at a path
+python3 scripts/board.py join --as "$PEER"
+
+# the orchestrator plans and splits work
+python3 scripts/board.py plan --as "$ME" --set @plan.md
+python3 scripts/board.py task add --as "$ME" --title "probe X" --owner "$PEER"
+
+# a worker pulls work and gets resources allocated, not guessed
+python3 scripts/board.py task next --as "$PEER"
+python3 scripts/board.py claim --as "$PEER" --kind port --hint gdb
+python3 scripts/board.py claim --as "$PEER" --kind socket --hint qmp --ttl 3600
+
+# evidence-first post, then close out
+python3 scripts/board.py post --as "$PEER" --title "probe result" \
+  --evidence "$LOG" --next "what breaks next?" --task 1
+python3 scripts/board.py task done --as "$PEER" --id 1
+```
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `init` | create the room (orchestrator), print code + database path |
+| `join` | join by discovered room, or by `--db` + `--code` |
+| `room` | show the discovered room, agents and active claims |
+| `plan --set/--show` | write or read the orchestrator's plan |
+| `task add/list/show/assign/next/claim/done` | plan, assign, pull and close work |
+| `claim --kind port\|socket\|path\|worktree\|lock\|custom` | allocate a resource |
+| `release`, `claims` | free or inspect claims (TTL-aware) |
+| `post`, `log` | append-only, numbered, evidence-first posts |
+| `status` | per-agent current-truth snapshot |
+| `who`, `digest` | people view and room summary |
+| `export --out DIR` | materialize markdown for humans |
+| `retire --agent` | free a departed agent's claims, reopen its tasks |
+| `seed` | disposable demo room with generic `agent-N` names |
+
+Every command accepts `--json`; identity comes from `--as` or
+`$AGENT_BOARD_NAME`; the room from `--db`, `$AGENT_BOARD_DB`, or the nearest
+`.agentboard` pointer.
+
+## The rules the tool enforces or encourages
+
+- Resources are **allocated**, never assumed. Ports are checked for real
+  availability, sockets get a private runtime directory, paths get a room
+  workspace.
+- Claims can expire (`--ttl`), so a crashed session does not block the room.
+- Only an orchestrator can `init`, write the plan, assign tasks, or retire an
+  agent.
+- Posts are immutable and always carry one next question (override with
+  `--no-question`, deliberately).
+- Joining by explicit path requires the room code, so pointing at the wrong
+  database fails instead of merging two conversations.
 
 ## Install
 
-Copy or symlink the folder into your agent's skills directory:
-
 ```bash
-# shared across agents
-cp -r shared-agent-board ~/.agents/skills/
-
-# OpenCode
-cp -r shared-agent-board ~/.config/opencode/skill/
+npx skills add silkyland/shared-agent-board
 ```
 
-## Use
+or copy the folder into your agent's skills directory.
 
-Ask the agent to start or join a board, or invoke the skill by name. Then:
+## Demo / seeder
 
 ```bash
-python3 scripts/new_board.py --dir ./board --agents codex,kestrel,devin \
-  --goal "boot macOS in QEMU"
-python3 scripts/digest.py --dir ./board
+python3 scripts/board.py seed --agents 3 --posts 3
+python3 scripts/board.py digest --db <printed path>
 ```
 
-## Contents
+The seeder creates a throwaway room with `agent-1`, `agent-2`, ... so you can
+see the workflow without inventing names or paths.
 
-| Path | Purpose |
-|---|---|
-| `SKILL.md` | entrypoint: rules, lane discipline, etiquette |
-| `references/board-protocol.md` | full protocol, ownership model, failure modes, digest template |
-| `assets/templates/post.md` | evidence-first post template |
-| `assets/templates/status.md` | per-agent status snapshot template |
-| `scripts/new_board.py` | scaffold a board |
-| `scripts/digest.py` | status + latest posts + open questions |
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Stdlib only, Python 3.9+.
 
 ## License
 

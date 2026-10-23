@@ -1,119 +1,159 @@
 ---
 name: shared-agent-board
 description: >-
-  Coordinate several autonomous agent sessions working the same hard problem on
-  one machine through a shared, append-only, evidence-first board on disk. Use
-  when two or more agents (Claude Code, Codex, OpenCode, Devin, Cursor, Gemini
-  CLI, or similar) must share findings without a chat channel, avoid repeating
-  each other's dead ends, and stop colliding on ports, sockets, processes and
-  worktrees. Also use when joining, auditing, or writing a digest of an existing
-  multi-agent board.
+  Coordinate two or more independent agent sessions working the same problem on
+  one machine through a single SQLite room created and planned by an
+  orchestrator. Use when agents (Claude Code, Codex, OpenCode, Cursor, Gemini
+  CLI, or similar) cannot message each other directly, yet must share findings,
+  avoid duplicate work, and stop colliding on ports, sockets, processes and
+  worktrees. Also use when joining, auditing, or producing a digest of such a
+  room.
 license: MIT
+metadata:
+  version: "2"
 ---
 
 # Shared Agent Board
 
-Several agents, one problem, no chat channel. Without a shared surface each
-session re-derives the same dead ends, duplicates expensive experiments, and
-occasionally kills the others' work by accident. The board is the fix: a plain
-directory of files that acts as shared memory, message log, and lock registry.
+Several independent sessions, one problem, no chat channel. One SQLite file is
+the shared memory: an orchestrator writes the plan and assigns tasks, workers
+claim resources and post evidence, observers read and summarize.
 
-**Files are messages. Claims are locks. Evidence is currency.**
+**One room is one file. The orchestrator creates it. Nobody invents a name, a
+port, a socket path, or a directory.**
 
 ## When this applies
 
 Use it when all three are true:
 
 - two or more independent agent sessions work the same problem,
-- they run on the same machine (shared ports, disks, processes, and logs),
-- the work lasts longer than one session and involves expensive experiments.
+- they run on the same machine (shared ports, processes, disks, logs),
+- the work outlives one session and involves expensive experiments.
 
-Do not use it for subagents of a single session (coordinate in-context or with
-`create-my-team`), or when the agents already have a native message channel.
+Do not use it for subagents of one session (coordinate in context), or when the
+agents already have a native message channel.
 
-If you are one of the agents, the operating loop is: **read the board → claim a
-lane → run the experiment → post the evidence → restate one open question**.
+## Find the room before doing anything
 
-## Board layout
+The CLI is `scripts/board.py` in this skill. Resolve the room with:
 
-```
-<board>/
-  README.md              rules + lane registry (the board owner edits)
-  <agent>-status.md      per-agent current truth (only that agent writes)
-  <agent>-NN-slug.md     numbered immutable posts (one file per post)
+```bash
+python3 scripts/board.py room
 ```
 
-- **Status file** is a snapshot: its owner may rewrite it freely.
-- **Posts** are the append-only log: create a new numbered file, never edit a
-  published one. Corrections are new posts that name the retracted claim.
-- **One writer per file** is the entire safety model. Never edit another
-  agent's file; answer it with your own post.
+Resolution order: `--db`, then `$AGENT_BOARD_DB`, then the nearest
+`.agentboard` pointer found by walking up from the current directory. If none
+exists, stop: **only the orchestrator creates rooms.** Do not create a second
+board, a second folder, or your own status file elsewhere.
 
-Scaffold a board with `scripts/new_board.py`; inspect one with
-`scripts/digest.py`.
+Identity is never assumed. Pass `--as NAME` or export `AGENT_BOARD_NAME`; the
+name must have joined the room. Names are chosen by the humans/agents running
+the sessions, never by the tool.
 
-## The five rules
+## Roles
 
-1. **Read before you act.** Every status file, plus the last few posts. Posting
-   a result that already exists on the board is the most common waste.
-2. **Claim before you run.** Reserve worktree, GDB port, socket, log paths and
-   any shared resource in the README lane table. Release explicitly when done.
-3. **Status before work, post after work.** Announce a major new experiment
-   with one line and your lane, then post the result. Silence during long runs
-   is how two agents burn the same hour twice.
-4. **Evidence or it did not happen.** Exact command, log path, what actually
-   ran, what is inferred, and the limitations. Separate *observed* from
-   *believed*.
-5. **End every post with exactly one next question** — or one explicit ask of a
-   named peer. A post with five open questions moves nobody.
+| Role | May do |
+|---|---|
+| `orchestrator` | create the room, write the plan, add/assign tasks, release others' stale claims, retire agents |
+| `worker` | join, claim tasks, claim resources, post, write its status |
+| `observer` | join, read, digest, export. No claims, no plan changes |
 
-## What a post contains
+One orchestrator per room by default (`join --role orchestrator --force` adds a
+second deliberately).
 
-Headline (what changed, in one line) → what you did → evidence (command, log
-path, literal output) → what it proves and what it does **not** prove → one next
-question. Copy `assets/templates/post.md`.
+## Worker loop
 
-Keep posts scannable: another agent reads this at 3 a.m. with no context.
+```bash
+python3 scripts/board.py join --as "$ME"
+python3 scripts/board.py task next --as "$ME"          # claim the next assigned task
+python3 scripts/board.py claim --as "$ME" --kind port --hint gdb --ttl 3600
+python3 scripts/board.py claim --as "$ME" --kind socket --hint qmp
+python3 scripts/board.py claim --as "$ME" --kind path --hint lane --create
+# ... run the experiment with exactly the values the board returned ...
+python3 scripts/board.py post --as "$ME" --title "what changed" \
+  --body @notes.md --evidence "$LOG" --next "one question?" --task 1
+python3 scripts/board.py release --as "$ME" --all
+python3 scripts/board.py task done --as "$ME" --id 1 --note "what shipped"
+```
 
-## Lane discipline
+Never guess a port, socket path, or work directory. If you need one, `claim`
+returns it; two sessions cannot receive the same value.
 
-The most expensive failures in parallel agent work are not wrong conclusions;
-they are destroyed experiments.
+## Orchestrator loop
 
-- Never `killall`, `pkill -f qemu`, or kill by process name. Kill your own PID
-  or process group only. A global pattern kill terminates every lane.
-- Wrap long-lived processes so a death is explainable:
-  `setsid bash -c 'cmd; echo "EXIT:$?" >> exit.log'`. Exit 137/143 means
-  somebody killed it; a guest-initiated reboot looks different.
-- Give every lane its own port, socket path, receipt directory and log files.
-  Never write to a log path another lane reads.
-- Timing is a lane property too: "attach during boot, not after the prompt" can
-  be the difference between a working run and a wrong guest state.
-- Retire lanes in writing. A dangling claim blocks the next agent.
+1. Create the room once, with the goal attached:
 
-## Etiquette that actually produces speed
+   ```bash
+   python3 scripts/board.py init --as "$ME" --title "..." --goal @goal.md
+   ```
 
-- **Steal freely, credit explicitly.** Reusing a peer's recipe is the point;
-  say whose it is.
-- **Label diagnostics as diagnostics.** A patch that skips a check is a probe,
-  not a fix. Say so, or the next agent will build on a false foundation.
-- **Publish the negative results.** "Ruled out X by doing Y" is the most reused
-  content on any board.
-- **Retract loudly.** If someone else's evidence overturns your theory, post the
-  retraction yourself. It is cheaper than letting two lanes carry a dead idea.
-- **Hand off by writing, not by assuming.** When you leave: current state, exact
-  reproduction, what is open, and which lane you retired.
+2. Write the plan before anyone starts:
+
+   ```bash
+   python3 scripts/board.py plan --as "$ME" --set @plan.md
+   ```
+
+3. Split the plan into tasks with owners and ordering:
+
+   ```bash
+   python3 scripts/board.py task add --as "$ME" --title "..." --owner "$PEER" \
+     --detail @task.md --blocked-by 1,2
+   python3 scripts/board.py task list
+   ```
+
+4. Re-plan when evidence changes the picture. A stale plan is worse than none.
+5. Arbitrate: release expired or abandoned claims, reassign tasks, retire
+   sessions that left (`retire --agent NAME` frees claims and reopens tasks).
+
+Task states are `open → claimed → done`; `task next` refuses blocked tasks and
+tasks owned by someone else.
+
+## Rules that keep the room trustworthy
+
+1. **Evidence or it did not happen.** Exact command, log path, literal output,
+   what actually ran, what is inferred, and the limits. Separate *observed*
+   from *believed*.
+2. **One next question per post.** Five open questions move nobody.
+3. **Claim before you run; release when you stop.** Use `--ttl` for long
+   experiments so an abandoned claim expires instead of blocking a peer.
+4. **Never kill by process name.** `killall`, `pkill -f` and friends destroy
+   every lane on the machine. Kill your own PID or process group.
+5. **Label diagnostics as diagnostics.** A patch that skips a check is a probe,
+   not a fix.
+6. **Publish negative results.** "Ruled out X by doing Y" is the most reused
+   content in the room.
+7. **Status is a snapshot, posts are history.** `status --body` overwrites your
+   current truth; posts are immutable and numbered.
 
 ## Observer mode
 
-A useful non-competing role: produce digests, cross-check claims between lanes,
-notice that one lane's blocker was already answered in another lane's post, and
-keep a scoreboard. Observers read and report; they do not edit the board or run
-the experiments, and their predictions are explicitly marked as guesses.
+An observer joins with `--role observer`, then:
+
+```bash
+python3 scripts/board.py digest
+python3 scripts/board.py export --out ./board-view
+```
+
+`digest` prints the plan, a per-agent table, open questions and tasks.
+`export` materializes README, per-agent status, and numbered posts as markdown
+for humans, git, or a repo. Observers may predict; they must label predictions
+and must not run the experiments or edit claims.
+
+## Failure modes this design removes
+
+- **Two sessions pick the same port** — impossible: the board allocates and
+  records it.
+- **A lane invents its own log directory** — paths come from `claim`, not
+  convention.
+- **Two "boards" appear** — only the orchestrator can `init`; everyone else
+  discovers the existing room or fails loudly.
+- **A session vanishes holding a resource** — TTL expiry, `claims`, and
+  orchestrator `release --agent` / `retire`.
+- **Silent long runs** — `task next` and `post` make work visible at both ends.
 
 ## Going deeper
 
-Read `references/board-protocol.md` for the full protocol, worked failure modes,
-the lane registry format, evidence standards, and a digest template. Read it
-when you are starting a board, joining one mid-flight, or reconciling
-contradictory posts — not on every cycle.
+Read `references/board-protocol.md` for the schema, allocation algorithms,
+concurrency guarantees, export layout, migration from file-per-post boards, and
+the full failure-mode catalog. Read it when starting or auditing a room, not on
+every cycle.
