@@ -32,10 +32,15 @@ def headline(text: str) -> str:
 def next_question(text: str) -> str:
     lines = text.splitlines()
     for i, line in enumerate(lines):
-        if line.strip().lower().startswith("## next question"):
-            body = [x.strip() for x in lines[i + 1:] if x.strip()]
-            body = [x for x in body if not (x.startswith("<") and x.endswith(">"))]
-            return body[0] if body else "(empty)"
+        if not line.strip().lower().startswith("## next question"):
+            continue
+        for raw in lines[i + 1:]:
+            s = raw.strip()
+            if s.startswith("#"):
+                break
+            if not s or (s.startswith("<") and s.endswith(">")):
+                continue
+            return s
     return "(none stated)"
 
 
