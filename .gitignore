@@ -7,3 +7,6 @@ __pycache__/
 .agent-board/
 workspace/
 board-view/
+report/
+*.v3.bak
+*.bak

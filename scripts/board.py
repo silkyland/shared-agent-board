@@ -21,7 +21,9 @@ import argparse
 import json
 import os
 import re
+import hashlib
 import secrets
+import shutil
 import socket
 import sqlite3
 import sys
@@ -31,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 POINTER = ".agentboard"
-SCHEMA = 3
+SCHEMA = 4
 ROLES = ("orchestrator", "worker", "observer")
 KINDS = ("port", "socket", "path", "worktree", "lock", "custom")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -245,9 +247,98 @@ def schema(con: sqlite3.Connection, overwrite: bool = False) -> None:
         );
         """
     )
-    con.execute(
-        "INSERT OR IGNORE INTO meta(key, value) VALUES('schema', ?)", (str(SCHEMA),)
-    )
+    migrate(con)
+
+
+def _columns(con: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+
+
+def migrate(con: sqlite3.Connection) -> None:
+    """Bring an older room up to SCHEMA, additively. v3 -> v4 adds the arena layer."""
+    def current() -> int:
+        row = con.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
+        return int(row[0]) if row else 0
+
+    if current() >= SCHEMA:
+        return
+    have = current()
+    if have and con.execute("SELECT count(*) FROM room").fetchone()[0]:
+        main = next((r[2] for r in con.execute("PRAGMA database_list") if r[1] == "main"), "")
+        backup = Path(main + f".v{have}.bak") if main else None
+        if backup and not backup.exists():
+            dst = sqlite3.connect(str(backup))
+            try:
+                con.backup(dst)
+            finally:
+                dst.close()
+    with tx(con):
+        if current() >= SCHEMA:
+            return
+        for col, ddl in (
+            ("board_id", "INTEGER NOT NULL DEFAULT 1"),
+            ("kind", "TEXT NOT NULL DEFAULT 'note'"),
+            ("lane", "TEXT"),
+            ("accepted_at", "TEXT"),
+        ):
+            if col not in _columns(con, "posts"):
+                con.execute(f"ALTER TABLE posts ADD COLUMN {col} {ddl}")
+        if "token_hash" not in _columns(con, "agents"):
+            con.execute("ALTER TABLE agents ADD COLUMN token_hash TEXT")
+        for ddl in (
+            """CREATE TABLE IF NOT EXISTS boards(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                description TEXT,
+                opened_by TEXT NOT NULL,
+                parent_id INTEGER,
+                created_at TEXT NOT NULL,
+                closed_at TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS reviews(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_id INTEGER NOT NULL,
+                reviewer TEXT NOT NULL,
+                verdict TEXT NOT NULL,
+                note TEXT,
+                evidence TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(post_id, reviewer, verdict)
+            )""",
+            """CREATE TABLE IF NOT EXISTS ledger(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent TEXT NOT NULL,
+                post_id INTEGER,
+                reason TEXT NOT NULL,
+                points INTEGER NOT NULL,
+                by TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS lanes(
+                agent TEXT PRIMARY KEY,
+                branch TEXT,
+                worktree TEXT NOT NULL,
+                base_commit TEXT,
+                engine TEXT NOT NULL DEFAULT 'manual',
+                pid INTEGER,
+                log TEXT,
+                started_at TEXT,
+                ended_at TEXT
+            )""",
+            """CREATE INDEX IF NOT EXISTS posts_board ON posts(board_id, id)""",
+        ):
+            con.execute(ddl)
+        con.execute(
+            "INSERT OR IGNORE INTO boards(id, slug, title, description, opened_by, created_at) "
+            "VALUES(1, 'main', 'Main board', 'Central board for the whole room', 'system', ?)",
+            (now(),),
+        )
+        con.execute(
+            "INSERT INTO meta(key, value) VALUES('schema', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(SCHEMA),),
+        )
 
 
 def room_row(con: sqlite3.Connection) -> sqlite3.Row:
@@ -277,6 +368,10 @@ def agent_row(con: sqlite3.Connection, name: str | None) -> sqlite3.Row:
         die(f"unknown agent '{name}'. Join the room first: board.py join --as {name}")
     if row["retired_at"]:
         die(f"agent '{name}' was retired by the orchestrator")
+    if row["token_hash"]:
+        token = os.environ.get("AGENT_BOARD_TOKEN", "")
+        if hashlib.sha256(token.encode()).hexdigest() != row["token_hash"]:
+            die(f"'{name}' is a lane agent: set AGENT_BOARD_TOKEN to the token from its brief")
     con.execute("UPDATE agents SET last_seen = ? WHERE name = ?", (now(), name))
     return row
 
@@ -978,10 +1073,18 @@ def cmd_digest(args) -> None:
     lines += ["", "## open questions", ""]
     questions = con.execute(
         "SELECT n, agent, question FROM posts WHERE question IS NOT NULL AND question != '' "
-        "ORDER BY id DESC LIMIT 10"
+        "AND kind != 'question' ORDER BY id DESC LIMIT 10"
     ).fetchall()
     for q in questions:
         lines.append(f"- #{q['n']} {q['agent']}: {q['question']}")
+    asked = con.execute(
+        "SELECT n, agent, title FROM posts p WHERE kind = 'question' AND NOT EXISTS ("
+        "SELECT 1 FROM posts a WHERE a.reply_to = p.id AND a.kind = 'answer' "
+        "AND a.accepted_at IS NOT NULL) ORDER BY id DESC LIMIT 10"
+    ).fetchall()
+    for q in asked:
+        lines.append(f"- #{q['n']} {q['agent']} (open question): {q['title']}")
+    questions = list(questions) + list(asked)
     if not questions:
         lines.append("- (none)")
 
