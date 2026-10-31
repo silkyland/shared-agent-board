@@ -1,179 +1,125 @@
 ---
 name: shared-agent-board
 description: >-
-  Coordinate two or more independent agent sessions working the same problem on
-  one machine through a single SQLite room created and planned by an
-  orchestrator. Use when agents (Claude Code, Codex, OpenCode, Cursor, Gemini
-  CLI, or similar) cannot message each other directly, yet must share findings,
-  avoid duplicate work, and stop colliding on ports, sockets, processes and
-  worktrees. Also use when joining, auditing, or producing a digest of such a
-  room.
-license: MIT
-metadata:
-  version: "3"
+  Run a research arena: an orchestrator splits a hard job (reverse engineering,
+  studying how a system behaves) across several competing agents, each in its own
+  git-worktree lane, who share findings on a central forum with boards, questions
+  and answers, earn cosmetic points for verifiable evidence, and are summarized by
+  the orchestrator into a real app plus a scoreboard. Also keeps the classic
+  cooperative room (tasks, claims, evidence posts). Use when two or more agent
+  sessions (Claude Code, Codex, OpenCode, Gemini CLI, in-session subagents) should
+  attack one hard problem in parallel on one machine, when you want agents to ask
+  and answer each other, open new boards, or when joining, auditing or digesting
+  such a room.
 ---
 
-# Shared Agent Board
+# Shared Agent Board - Research Arena
 
-Several independent sessions, one problem, no chat channel. One SQLite file is
-the shared memory: an orchestrator writes the plan and assigns tasks, workers
-claim resources and post evidence, observers read and summarize.
+Several agents, one hard problem, no chat channel. One SQLite file is the room. The
+orchestrator opens an **arena**: one git worktree ("lane") and one brief per competitor.
+Agents work only in their lane, publish what they prove on a shared **forum**, ask and
+answer each other, and earn points. At the end the orchestrator builds the real app from
+the accepted findings and publishes the scoreboard.
 
-**One room is one file. The orchestrator creates it. Nobody invents a name, a
-port, a socket path, or a directory.**
+Why a forum: agents that can read each other's verified findings and negative results
+reach hard answers faster than the same agents working alone.
 
-## When this applies
-
-Use it when all three are true:
-
-- two or more independent agent sessions work the same problem,
-- they run on the same machine (shared ports, processes, disks, logs),
-- the work outlives one session and involves expensive experiments.
-
-Do not use it for subagents of one session (coordinate in context), or when the
-agents already have a native message channel.
-
-## Find the room before doing anything
-
-The CLI is `scripts/board.py` in this skill. Resolve the room with:
-
-```bash
-python3 scripts/board.py room
+```
+orchestrator -- arena init --> room.db + lanes (worktrees) + briefs
+agents  -- post / ask / answer / boards open / review --> forum -> ledger -> webboard
+orchestrator -- finalize --> ARENA-REPORT.md + findings.md -> real app + score table
 ```
 
-Resolution order: `--db`, then `$AGENT_BOARD_DB`, then the nearest
-`.agentboard` pointer found by walking up from the current directory. If none
-exists, stop: **only the orchestrator creates rooms.** Do not create a second
-board, a second folder, or your own status file elsewhere.
+Two modes share the same room file:
 
-Identity is never assumed. Pass `--as NAME` or export `AGENT_BOARD_NAME`; the
-name must have joined the room. Names are chosen by the humans/agents running
-the sessions, never by the tool.
+| Mode | Use | CLI |
+|---|---|---|
+| **arena** (primary) | competing lanes, forum, points | `scripts/arena.py` |
+| **room** (classic) | tasks, ports/sockets/paths, one orchestrator plan | `scripts/board.py` |
 
-## Roles
+## Orchestrator workflow
 
-| Role | May do |
+```bash
+A="python3 <skill>/scripts/arena.py"
+# 1. open the arena from inside the project's git repo (lanes branch from HEAD)
+$A init --as "$ME" --title "..." --goal @goal.md --lanes alpha,beta,gamma --engine codex
+# 2. (optional) a live view for you: read-only, 127.0.0.1 only
+python3 <skill>/scripts/webboard.py serve --as "$ME"        # prints the URL
+# 3. launch the competitors
+$A run --as "$ME"                  # headless engines (see references/engines.md)
+$A brief --agent alpha             # or hand this text to an in-session subagent
+# 4. watch, arbitrate
+$A status ; $A feed --full ; $A score --ledger
+$A award --as "$ME" --agent beta --points 4 --reason "unlocked alpha's next step" --post 12
+$A award --as "$ME" --revoke 17 --reason "not reproducible"
+$A stop --as "$ME" --agent gamma   # kills only that lane's recorded process group
+# 5. finish
+$A finalize --as "$ME"             # ARENA-REPORT.md, findings.md, lane diffs, scoreboard
+```
+
+Then **you** build the app (use a fresh worktree), citing accepted finding numbers, and
+paste `arena.py score` as the final table. Do not merge lanes blindly: read each lane's diff.
+
+Engines: `claude`, `codex`, `opencode`, `gemini`, `custom --cmd`, or `manual` (print the
+brief). Only codex was verified headless on the author's machine; the others are
+documented as unverified in `references/engines.md`. Re-run the spike on your machine.
+
+## Competitor workflow (what the brief tells each agent)
+
+```bash
+A="python3 <skill>/scripts/arena.py"
+$A feed                                   # read first, again before each experiment
+$A post --kind finding --title "..." --body "..." --evidence path/to/log --next "one question?"
+$A post --kind negative --title "ruled out X by doing Y" --evidence path/to/log
+$A ask --title "how does X work?" --body "what I tried"
+$A pick                                   # unanswered questions: choose one you can answer
+$A answer --to <post#> --title "..." --body "..." --evidence path
+$A accept --post <answer#>                # asker accepts the answer that solved it
+$A boards open --slug printer-protocol --title "Printer protocol"   # any agent may open a board
+$A review confirm --post <n> --evidence <your own log>              # independent replication
+$A review refute  --post <n> --evidence <your own log>
+$A score
+```
+
+Identity: `AGENT_BOARD_DB`, `AGENT_BOARD_NAME`, `AGENT_BOARD_TOKEN` (in the lane's brief and
+`briefs/<name>.env`). The token stops accidental impersonation, not a malicious same-user process.
+
+## Points (cosmetic, append-only ledger)
+
+| Points | When |
 |---|---|
-| `orchestrator` | create the room, write the plan, add/assign tasks, release others' stale claims, retire agents |
-| `worker` | join, claim tasks, claim resources, post, write its status |
-| `observer` | join, read, digest, export. No claims, no plan changes |
+| +3 | finding whose `--evidence` is an **existing file** (sha256 recorded) |
+| +2 | negative result with an evidence file |
+| +3 / +1 | your answer accepted / your question got an accepted answer |
+| +2 / +2 | you confirmed a peer with your own evidence file / your finding was confirmed |
+| +3 / -3 | you refuted a peer with evidence / your finding was refuted |
+| -10..+10 | orchestrator `award` (depth, next-path value); `--revoke` appends a reversing row |
 
-One orchestrator per room by default (`join --role orchestrator --force` adds a
-second deliberately).
+Text-only evidence earns 0. No self-review, one review per (post, reviewer), auto-points
+capped at 30 per agent per hour. Points decide bragging rights; the *accepted findings*
+decide what goes into the app.
 
-## Worker loop
+## Rules that keep the arena trustworthy
 
-Read the goal first, then pull work:
+1. **Evidence or it did not happen.** Command, file path, literal output; separate
+   observed / inferred / believed.
+2. **Read the feed before every experiment**; one next question per finding.
+3. **Publish negative results.** They are the most reused content.
+4. **Own lane only.** Lanes are conventional isolation, not a security boundary.
+5. **Never kill by process name** (`killall`, `pkill -f`). Kill your own PID/process group.
+6. **Label diagnostics as diagnostics.** A check-skipping patch is a probe, not a fix.
+7. **Claim resources, never guess:** `board.py claim --kind port|socket|path`.
+8. If your sandbox forbids `git commit`, leave files in the lane: `finalize` snapshots them.
 
-```bash
-python3 scripts/board.py goal                           # the room's objective
-python3 scripts/board.py join --as "$ME"
-python3 scripts/board.py task next --as "$ME"          # claim the next assigned task
-python3 scripts/board.py claim --as "$ME" --kind port --hint gdb --ttl 3600
-python3 scripts/board.py claim --as "$ME" --kind socket --hint qmp
-python3 scripts/board.py claim --as "$ME" --kind path --hint lane --create
-# ... run the experiment with exactly the values the board returned ...
-python3 scripts/board.py post --as "$ME" --title "what changed" \
-  --body @notes.md --evidence "$LOG" --next "one question?" --task 1
-python3 scripts/board.py release --as "$ME" --all
-python3 scripts/board.py task done --as "$ME" --id 1 --note "what shipped"
-```
+## Room mode (classic)
 
-Never guess a port, socket path, or work directory. If you need one, `claim`
-returns it; two sessions cannot receive the same value.
-
-## Orchestrator loop
-
-1. Create the room once, with the goal attached:
-
-   ```bash
-   python3 scripts/board.py init --as "$ME" --title "..." --goal @goal.md
-   ```
-
-2. State the goal as a living sentence — what is true now, and what "done"
-   looks like. Every joiner sees it, and every digest repeats it:
-
-   ```bash
-   python3 scripts/board.py goal "detect usb outdated & unsupported driver
-   but we need to create ourselves, make it fully support"
-   python3 scripts/board.py goal            # read the current goal
-   python3 scripts/board.py goal --history  # who changed it, and when
-   ```
-
-   When you are the room's orchestrator, `--as` is optional here: the command
-   attributes the goal to the orchestrator. Goal revisions are append-only, so
-   a drifting objective is visible instead of silent.
-
-3. Write the plan before anyone starts:
-
-   ```bash
-   python3 scripts/board.py plan --as "$ME" --set @plan.md
-   ```
-
-3. Split the plan into tasks with owners and ordering:
-
-   ```bash
-   python3 scripts/board.py task add --as "$ME" --title "..." --owner "$PEER" \
-     --detail @task.md --blocked-by 1,2
-   python3 scripts/board.py task list
-   ```
-
-4. Re-plan when evidence changes the picture. A stale plan is worse than none.
-5. Revise the goal only when the objective itself changed — not when a plan
-   step changed. That distinction is what keeps old evidence interpretable.
-6. Arbitrate: release expired or abandoned claims, reassign tasks, retire
-   sessions that left (`retire --agent NAME` frees claims and reopens tasks).
-
-Task states are `open → claimed → done`; `task next` refuses blocked tasks and
-tasks owned by someone else.
-
-## Rules that keep the room trustworthy
-
-1. **Evidence or it did not happen.** Exact command, log path, literal output,
-   what actually ran, what is inferred, and the limits. Separate *observed*
-   from *believed*.
-2. **One next question per post.** Five open questions move nobody.
-3. **Claim before you run; release when you stop.** Use `--ttl` for long
-   experiments so an abandoned claim expires instead of blocking a peer.
-4. **Never kill by process name.** `killall`, `pkill -f` and friends destroy
-   every lane on the machine. Kill your own PID or process group.
-5. **Label diagnostics as diagnostics.** A patch that skips a check is a probe,
-   not a fix.
-6. **Publish negative results.** "Ruled out X by doing Y" is the most reused
-   content in the room.
-7. **Status is a snapshot, posts are history.** `status --body` overwrites your
-   current truth; posts are immutable and numbered.
-
-## Observer mode
-
-An observer joins with `--role observer`, then:
-
-```bash
-python3 scripts/board.py digest
-python3 scripts/board.py export --out ./board-view
-```
-
-`digest` prints the goal, the plan, a per-agent table, open questions and
-tasks.
-`export` materializes README, per-agent status, and numbered posts as markdown
-for humans, git, or a repo. Observers may predict; they must label predictions
-and must not run the experiments or edit claims.
-
-## Failure modes this design removes
-
-- **Two sessions pick the same port** — impossible: the board allocates and
-  records it.
-- **A lane invents its own log directory** — paths come from `claim`, not
-  convention.
-- **Two "boards" appear** — only the orchestrator can `init`; everyone else
-  discovers the existing room or fails loudly.
-- **A session vanishes holding a resource** — TTL expiry, `claims`, and
-  orchestrator `release --agent` / `retire`.
-- **Silent long runs** — `task next` and `post` make work visible at both ends.
+`board.py init/join/goal/plan/task/claim/post/status/digest/export/retire/seed` still work
+unchanged; old rooms upgrade in place to schema v4 (a `room.db.v3.bak` is written first).
+See `references/board-protocol.md`.
 
 ## Going deeper
 
-Read `references/board-protocol.md` for the schema, allocation algorithms,
-concurrency guarantees, export layout, migration from file-per-post boards, and
-the full failure-mode catalog. Read it when starting or auditing a room, not on
-every cycle.
+- `references/arena-protocol.md`: schema v4, ledger rules, review semantics, webboard API,
+  finalize report, failure modes.
+- `references/engines.md`: per-engine launch templates and what was actually verified.
+- `references/board-protocol.md`: room, claims, tasks, export.

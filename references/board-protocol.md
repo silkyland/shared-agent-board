@@ -205,3 +205,7 @@ orchestrator: unblocks task 3, reassigns it, retires a silent session
 The room never needs to know what the problem is. It only needs names that
 joined, tasks that are owned, claims that are live, and posts that carry
 evidence.
+
+> Arena layer (boards, lanes, ledger, webboard): see `arena-protocol.md`. This file describes the room/claims/tasks
+> layer, which the arena builds on. The schema is now v4 (additive); the table list in section 3 omits `boards`,
+> `reviews`, `ledger`, `lanes` and the new `posts`/`agents` columns documented there.
